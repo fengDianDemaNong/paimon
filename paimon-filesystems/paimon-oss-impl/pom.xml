@@ -34,6 +34,17 @@
     <properties>
         <fs.oss.sdk.version>3.13.2</fs.oss.sdk.version>
     </properties>
+        <repositories>
+        <repository>
+            <id>huaweicloud-repo</id>
+            <url>https://repo.huaweicloud.com/repository/maven/</url>
+        </repository>
+        <!-- for huawei obs sdk -->
+        <repository>
+            <id>huawei-obs-sdk</id>
+            <url>https://repo.huaweicloud.com/repository/maven/huaweicloudsdk/</url>
+        </repository>
+     </repositories>
 
     <dependencies>
         <dependency>
