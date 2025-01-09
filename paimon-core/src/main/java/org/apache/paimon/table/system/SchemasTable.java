@@ -18,17 +18,23 @@
 
 package org.apache.paimon.table.system;
 
-import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.disk.IOManager;
-import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.predicate.And;
+import org.apache.paimon.predicate.CompoundPredicate;
 import org.apache.paimon.predicate.Equal;
+import org.apache.paimon.predicate.GreaterOrEqual;
+import org.apache.paimon.predicate.GreaterThan;
+import org.apache.paimon.predicate.InPredicateVisitor;
 import org.apache.paimon.predicate.LeafPredicate;
 import org.apache.paimon.predicate.LeafPredicateExtractor;
+import org.apache.paimon.predicate.LessOrEqual;
+import org.apache.paimon.predicate.LessThan;
+import org.apache.paimon.predicate.Or;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.SchemaManager;
@@ -53,18 +59,17 @@ import org.apache.paimon.utils.SerializationUtils;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.Iterators;
 
-import javax.annotation.Nullable;
-
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
+import java.util.Optional;
 
 import static org.apache.paimon.catalog.Catalog.SYSTEM_TABLE_SPLITTER;
 
@@ -88,21 +93,13 @@ public class SchemasTable implements ReadonlyTable {
                             new DataField(5, "comment", SerializationUtils.newStringType(true)),
                             new DataField(6, "update_time", new TimestampType(false, 3))));
 
-    private final FileIO fileIO;
     private final Path location;
-    private final String branch;
+
+    private final FileStoreTable dataTable;
 
     public SchemasTable(FileStoreTable dataTable) {
-        this(
-                dataTable.fileIO(),
-                dataTable.location(),
-                CoreOptions.branch(dataTable.schema().options()));
-    }
-
-    public SchemasTable(FileIO fileIO, Path location, String branchName) {
-        this.fileIO = fileIO;
-        this.location = location;
-        this.branch = branchName;
+        this.location = dataTable.location();
+        this.dataTable = dataTable;
     }
 
     @Override
@@ -127,32 +124,24 @@ public class SchemasTable implements ReadonlyTable {
 
     @Override
     public InnerTableRead newRead() {
-        return new SchemasRead(fileIO);
+        return new SchemasRead();
     }
 
     @Override
     public Table copy(Map<String, String> dynamicOptions) {
-        return new SchemasTable(fileIO, location, branch);
+        return new SchemasTable(dataTable.copy(dynamicOptions));
     }
 
-    private class SchemasScan extends ReadOnceTableScan {
-        private @Nullable LeafPredicate schemaId;
-
-        @Override
-        public InnerTableScan withFilter(Predicate predicate) {
-            if (predicate == null) {
-                return this;
-            }
-
-            Map<String, LeafPredicate> leafPredicates =
-                    predicate.visit(LeafPredicateExtractor.INSTANCE);
-            schemaId = leafPredicates.get("schema_id");
-            return this;
-        }
+    private static class SchemasScan extends ReadOnceTableScan {
 
         @Override
         public Plan innerPlan() {
-            return () -> Collections.singletonList(new SchemasSplit(location, schemaId));
+            return () -> Collections.singletonList(new SchemasSplit());
+        }
+
+        @Override
+        public InnerTableScan withFilter(Predicate predicate) {
+            return this;
         }
     }
 
@@ -161,51 +150,95 @@ public class SchemasTable implements ReadonlyTable {
 
         private static final long serialVersionUID = 1L;
 
-        private final Path location;
-
-        private final @Nullable LeafPredicate schemaId;
-
-        private SchemasSplit(Path location, @Nullable LeafPredicate schemaId) {
-            this.location = location;
-            this.schemaId = schemaId;
-        }
-
+        @Override
         public boolean equals(Object o) {
             if (this == o) {
                 return true;
             }
-            if (o == null || getClass() != o.getClass()) {
-                return false;
-            }
-            SchemasSplit that = (SchemasSplit) o;
-            return Objects.equals(location, that.location)
-                    && Objects.equals(schemaId, that.schemaId);
+            return o != null && getClass() == o.getClass();
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(location, schemaId);
+            return 0;
         }
     }
 
     /** {@link TableRead} implementation for {@link SchemasTable}. */
     private class SchemasRead implements InnerTableRead {
 
-        private final FileIO fileIO;
-        private int[][] projection;
+        private RowType readType;
 
-        public SchemasRead(FileIO fileIO) {
-            this.fileIO = fileIO;
-        }
+        private Optional<Long> optionalFilterSchemaIdMax = Optional.empty();
+        private Optional<Long> optionalFilterSchemaIdMin = Optional.empty();
+        private final List<Long> schemaIds = new ArrayList<>();
 
         @Override
         public InnerTableRead withFilter(Predicate predicate) {
+            if (predicate == null) {
+                return this;
+            }
+
+            String leafName = "schema_id";
+            if (predicate instanceof CompoundPredicate) {
+                CompoundPredicate compoundPredicate = (CompoundPredicate) predicate;
+                if ((compoundPredicate.function()) instanceof And) {
+                    List<Predicate> children = compoundPredicate.children();
+                    for (Predicate leaf : children) {
+                        handleLeafPredicate(leaf, leafName);
+                    }
+                }
+
+                // optimize for IN filter
+                if ((compoundPredicate.function()) instanceof Or) {
+                    InPredicateVisitor.extractInElements(predicate, leafName)
+                            .ifPresent(
+                                    leafs ->
+                                            leafs.forEach(
+                                                    leaf ->
+                                                            schemaIds.add(
+                                                                    Long.parseLong(
+                                                                            leaf.toString()))));
+                }
+            } else {
+                handleLeafPredicate(predicate, leafName);
+            }
+
             return this;
         }
 
+        public void handleLeafPredicate(Predicate predicate, String leafName) {
+            LeafPredicate snapshotPred =
+                    predicate.visit(LeafPredicateExtractor.INSTANCE).get(leafName);
+            if (snapshotPred != null) {
+                if (snapshotPred.function() instanceof Equal) {
+                    optionalFilterSchemaIdMin = Optional.of((Long) snapshotPred.literals().get(0));
+                    optionalFilterSchemaIdMax = Optional.of((Long) snapshotPred.literals().get(0));
+                }
+
+                if (snapshotPred.function() instanceof GreaterThan) {
+                    optionalFilterSchemaIdMin =
+                            Optional.of((Long) snapshotPred.literals().get(0) + 1);
+                }
+
+                if (snapshotPred.function() instanceof GreaterOrEqual) {
+                    optionalFilterSchemaIdMin = Optional.of((Long) snapshotPred.literals().get(0));
+                }
+
+                if (snapshotPred.function() instanceof LessThan) {
+                    optionalFilterSchemaIdMax =
+                            Optional.of((Long) snapshotPred.literals().get(0) - 1);
+                }
+
+                if (snapshotPred.function() instanceof LessOrEqual) {
+                    optionalFilterSchemaIdMax = Optional.of((Long) snapshotPred.literals().get(0));
+                }
+            }
+        }
+
         @Override
-        public InnerTableRead withProjection(int[][] projection) {
-            this.projection = projection;
+        public InnerTableRead withReadType(RowType readType) {
+            this.readType = readType;
             return this;
         }
 
@@ -219,27 +252,24 @@ public class SchemasTable implements ReadonlyTable {
             if (!(split instanceof SchemasSplit)) {
                 throw new IllegalArgumentException("Unsupported split: " + split.getClass());
             }
-            SchemasSplit schemasSplit = (SchemasSplit) split;
-            LeafPredicate predicate = schemasSplit.schemaId;
-            Path location = schemasSplit.location;
-            SchemaManager manager = new SchemaManager(fileIO, location, branch);
+            SchemaManager manager = dataTable.schemaManager();
 
-            Collection<TableSchema> tableSchemas = Collections.emptyList();
-            if (predicate != null
-                    && predicate.function() instanceof Equal
-                    && predicate.literals().get(0) instanceof Long) {
-                Long equalValue = (Long) predicate.literals().get(0);
-                if (manager.schemaExists(equalValue)) {
-                    tableSchemas = Collections.singletonList(manager.schema(equalValue));
-                }
+            Collection<TableSchema> tableSchemas;
+            if (!schemaIds.isEmpty()) {
+                tableSchemas = manager.schemasWithId(schemaIds);
             } else {
-                tableSchemas = manager.listAll();
+                tableSchemas =
+                        manager.listWithRange(optionalFilterSchemaIdMax, optionalFilterSchemaIdMin);
             }
+
             Iterator<InternalRow> rows = Iterators.transform(tableSchemas.iterator(), this::toRow);
-            if (projection != null) {
+            if (readType != null) {
                 rows =
                         Iterators.transform(
-                                rows, row -> ProjectedRow.from(projection).replaceRow(row));
+                                rows,
+                                row ->
+                                        ProjectedRow.from(readType, SchemasTable.TABLE_TYPE)
+                                                .replaceRow(row));
             }
             return new IteratorRecordReader<>(rows);
         }

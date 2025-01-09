@@ -18,6 +18,7 @@
 
 package org.apache.paimon;
 
+import org.apache.paimon.CoreOptions.ExternalPathStrategy;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.deletionvectors.DeletionVectorsIndexFile;
 import org.apache.paimon.fs.FileIO;
@@ -31,6 +32,7 @@ import org.apache.paimon.metastore.AddPartitionTagCallback;
 import org.apache.paimon.metastore.MetastoreClient;
 import org.apache.paimon.operation.ChangelogDeletion;
 import org.apache.paimon.operation.FileStoreCommitImpl;
+import org.apache.paimon.operation.ManifestsReader;
 import org.apache.paimon.operation.PartitionExpire;
 import org.apache.paimon.operation.SnapshotDeletion;
 import org.apache.paimon.operation.TagDeletion;
@@ -46,12 +48,15 @@ import org.apache.paimon.table.CatalogEnvironment;
 import org.apache.paimon.table.sink.CallbackUtils;
 import org.apache.paimon.table.sink.CommitCallback;
 import org.apache.paimon.table.sink.TagCallback;
+import org.apache.paimon.tag.SuccessFileTagCallback;
 import org.apache.paimon.tag.TagAutoManager;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.SegmentsCache;
 import org.apache.paimon.utils.SnapshotManager;
 import org.apache.paimon.utils.TagManager;
+
+import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.Cache;
 
 import javax.annotation.Nullable;
 
@@ -60,6 +65,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+
+import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /**
  * Base {@link FileStore} implementation.
@@ -71,23 +78,27 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
     protected final FileIO fileIO;
     protected final SchemaManager schemaManager;
     protected final TableSchema schema;
+    protected final String tableName;
     protected final CoreOptions options;
     protected final RowType partitionType;
     private final CatalogEnvironment catalogEnvironment;
 
     @Nullable private final SegmentsCache<Path> writeManifestCache;
     @Nullable private SegmentsCache<Path> readManifestCache;
+    @Nullable private Cache<Path, Snapshot> snapshotCache;
 
     protected AbstractFileStore(
             FileIO fileIO,
             SchemaManager schemaManager,
             TableSchema schema,
+            String tableName,
             CoreOptions options,
             RowType partitionType,
             CatalogEnvironment catalogEnvironment) {
         this.fileIO = fileIO;
         this.schemaManager = schemaManager;
         this.schema = schema;
+        this.tableName = tableName;
         this.options = options;
         this.partitionType = partitionType;
         this.catalogEnvironment = catalogEnvironment;
@@ -98,16 +109,62 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
 
     @Override
     public FileStorePathFactory pathFactory() {
+        return pathFactory(options.fileFormatString());
+    }
+
+    protected FileStorePathFactory pathFactory(String format) {
         return new FileStorePathFactory(
                 options.path(),
                 partitionType,
                 options.partitionDefaultName(),
-                options.fileFormat().getFormatIdentifier());
+                format,
+                options.dataFilePrefix(),
+                options.changelogFilePrefix(),
+                options.legacyPartitionName(),
+                options.fileSuffixIncludeCompression(),
+                options.fileCompression(),
+                options.dataFilePathDirectory(),
+                createExternalPaths());
+    }
+
+    private List<Path> createExternalPaths() {
+        String externalPaths = options.dataFileExternalPaths();
+        ExternalPathStrategy strategy = options.externalPathStrategy();
+        if (externalPaths == null
+                || externalPaths.isEmpty()
+                || strategy == ExternalPathStrategy.NONE) {
+            return Collections.emptyList();
+        }
+
+        String specificFS = options.externalSpecificFS();
+
+        List<Path> paths = new ArrayList<>();
+        for (String pathString : externalPaths.split(",")) {
+            Path path = new Path(pathString.trim());
+            String scheme = path.toUri().getScheme();
+            if (scheme == null) {
+                throw new IllegalArgumentException("scheme should not be null: " + path);
+            }
+
+            if (strategy == ExternalPathStrategy.SPECIFIC_FS) {
+                checkArgument(
+                        specificFS != null,
+                        "External path specificFS should not be null when strategy is specificFS.");
+                if (scheme.equalsIgnoreCase(specificFS)) {
+                    paths.add(path);
+                }
+            } else {
+                paths.add(path);
+            }
+        }
+
+        checkArgument(!paths.isEmpty(), "External paths should not be empty");
+        return paths;
     }
 
     @Override
     public SnapshotManager snapshotManager() {
-        return new SnapshotManager(fileIO, options.path(), options.branch());
+        return new SnapshotManager(fileIO, options.path(), options.branch(), snapshotCache);
     }
 
     @Override
@@ -174,6 +231,14 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
                 new StatsFile(fileIO, pathFactory().statsFileFactory()));
     }
 
+    protected ManifestsReader newManifestsReader(boolean forWrite) {
+        return new ManifestsReader(
+                partitionType,
+                options.partitionDefaultName(),
+                snapshotManager(),
+                manifestListFactory(forWrite));
+    }
+
     @Override
     public RowType partitionType() {
         return partitionType;
@@ -199,8 +264,10 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
         return new FileStoreCommitImpl(
                 fileIO,
                 schemaManager,
+                tableName,
                 commitUser,
                 partitionType,
+                options,
                 options.partitionDefaultName(),
                 pathFactory(),
                 snapshotManager(),
@@ -218,7 +285,9 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
                 newStatsFileHandler(),
                 bucketMode(),
                 options.scanManifestParallelism(),
-                callbacks);
+                callbacks,
+                options.commitMaxRetries(),
+                options.commitTimeout());
     }
 
     @Override
@@ -290,7 +359,8 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
                 newScan(),
                 newCommit(commitUser),
                 metastoreClient,
-                options.endInputCheckPartitionExpire());
+                options.endInputCheckPartitionExpire(),
+                options.partitionExpireMaxNum());
     }
 
     @Override
@@ -313,6 +383,9 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
             callbacks.add(
                     new AddPartitionTagCallback(metastoreClientFactory.create(), partitionField));
         }
+        if (options.tagCreateSuccessFile()) {
+            callbacks.add(new SuccessFileTagCallback(fileIO, newTagManager().tagDirectory()));
+        }
         return callbacks;
     }
 
@@ -324,5 +397,10 @@ abstract class AbstractFileStore<T> implements FileStore<T> {
     @Override
     public void setManifestCache(SegmentsCache<Path> manifestCache) {
         this.readManifestCache = manifestCache;
+    }
+
+    @Override
+    public void setSnapshotCache(Cache<Path, Snapshot> cache) {
+        this.snapshotCache = cache;
     }
 }
